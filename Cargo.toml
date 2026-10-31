@@ -1,0 +1,22 @@
+[package]
+name = "netio-bridge"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "Bridge Cisco IOL NETIO ports to Linux interfaces, for Containerlab IOL images"
+repository = "https://github.com/trustywolf/netio-bridge"
+readme = "README.md"
+categories = ["network-programming", "command-line-utilities"]
+publish = false
+
+# Linux only: Ethernet ports are AF_PACKET sockets.
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+# A panicking thread takes the whole process down, so the entrypoint's restart
+# loop brings every port back instead of leaving one port dead.
+panic = "abort"
+strip = true
