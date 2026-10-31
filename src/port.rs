@@ -202,10 +202,12 @@ impl Port {
                     continue;
                 }
             };
-            missing_logged = false;
+            // A port that opens at start-up is routine; one that comes back
+            // after a NOTICE (missing, or gone) gets a NOTICE too.
+            let waited = std::mem::take(&mut missing_logged);
             self.stats.opens.inc();
             let msg = format!("{}: forwarding (ifindex {ifindex})", self.label);
-            if self.stats.opens.get() == 1 {
+            if self.stats.opens.get() == 1 && !waited {
                 log::info(&msg);
             } else {
                 log::notice(&msg);
