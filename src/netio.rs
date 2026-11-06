@@ -9,7 +9,8 @@
 //! A port byte encodes `Ethernet<slot>/<port>` as `(port << 4) | slot`.
 //! Data frames carry `msg_type` 1 and channel 0, followed by the Ethernet frame.
 
-use std::io;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Write};
 use std::mem;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixDatagram;
@@ -86,6 +87,40 @@ impl Header {
             channel: buf[7],
         })
     }
+}
+
+/// Takes the write lock on `<path>.lck` that keeps a second bridge with the same
+/// id off the socket, and writes our PID into it. This is IOL's own convention
+/// for its NETIO socket (`/tmp/netio0/1.lck`). The lock is held until the
+/// returned file is closed or the process exits.
+pub fn lock(path: &str) -> Result<File, String> {
+    let name = format!("{path}.lck");
+    let mut f = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&name)
+        .map_err(|e| format!("open {name}: {e}"))?;
+    // SAFETY: flock is plain old data; all-zero is a valid value.
+    let mut fl: libc::flock = unsafe { mem::zeroed() };
+    fl.l_type = libc::F_WRLCK as libc::c_short;
+    fl.l_whence = libc::SEEK_SET as libc::c_short;
+    // SAFETY: f is an open descriptor and fl is valid for the call.
+    if unsafe { libc::fcntl(f.as_raw_fd(), libc::F_SETLK, &mut fl) } < 0 {
+        let e = io::Error::last_os_error();
+        // SAFETY: as above; F_GETLK fills fl with the lock that blocks ours.
+        if unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETLK, &mut fl) } == 0 && fl.l_pid > 0 {
+            return Err(format!(
+                "{name} is locked by PID {}: another netio-bridge serves {path}",
+                fl.l_pid
+            ));
+        }
+        return Err(format!("lock {name}: {e}"));
+    }
+    f.set_len(0)
+        .and_then(|()| writeln!(f, "{}", std::process::id()))
+        .map_err(|e| format!("write {name}: {e}"))?;
+    Ok(f)
 }
 
 /// A Unix datagram destination, prepared once and reused for every send.
@@ -224,5 +259,39 @@ mod tests {
         let base = mem::offset_of!(libc::sockaddr_un, sun_path);
         assert_eq!(d.len as usize, base + "/tmp/netio0/1".len() + 1);
         assert!(UnixDest::new("x".repeat(200)).is_err());
+    }
+
+    #[test]
+    fn lock_is_exclusive() {
+        use std::io::Read;
+        let path = std::env::temp_dir().join(format!("netio-lock-test-{}", std::process::id()));
+        let path = path.to_str().unwrap();
+        let name = format!("{path}.lck");
+        let held = lock(path).unwrap();
+        // Closing any descriptor of the file would drop our POSIX lock, so the
+        // checks below use one that stays open until the end.
+        let mut other = File::options().read(true).write(true).open(&name).unwrap();
+        let mut pid = String::new();
+        other.read_to_string(&mut pid).unwrap();
+        assert_eq!(pid, format!("{}\n", std::process::id()));
+        // A POSIX lock never conflicts within one process, but an open file
+        // description lock on another descriptor does.
+        // SAFETY: flock is plain old data; all-zero is a valid value.
+        let mut fl: libc::flock = unsafe { mem::zeroed() };
+        fl.l_type = libc::F_WRLCK as libc::c_short;
+        fl.l_whence = libc::SEEK_SET as libc::c_short;
+        // SAFETY: other is open and fl is valid for the call.
+        assert!(unsafe { libc::fcntl(other.as_raw_fd(), libc::F_OFD_SETLK, &mut fl) } < 0);
+        drop(held);
+        // SAFETY: as above.
+        assert_eq!(
+            unsafe { libc::fcntl(other.as_raw_fd(), libc::F_OFD_SETLK, &mut fl) },
+            0
+        );
+        // Now ours is the one that is refused.
+        assert!(lock(path).is_err());
+        drop(other);
+        assert!(lock(path).is_ok());
+        let _ = std::fs::remove_file(&name);
     }
 }

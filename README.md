@@ -38,10 +38,15 @@ IOL ports down for good:
   start-up is handled the same way.
 - The socket of a port is shared through `Mutex<Option<Arc<OwnedFd>>>`: a sender
   holds its own reference, so a socket being replaced is never closed under it.
-- The process exits only on a start-up error (invalid ini or NETMAP, NETIO
-  socket cannot be bound). Release builds abort on a panic, so a restart loop
-  around the process (see below) recovers every port instead of leaving one
-  thread dead.
+- One bridge per id: at start-up netio-bridge takes an `fcntl` write lock on
+  `/tmp/netio<uid>/<appl_id>.lck`, as IOL does for its own socket, and writes
+  its PID into it. A second instance (say, one started by hand for debugging)
+  exits with an error instead of unlinking the socket and taking it over, which
+  would leave IOL sending to a dead socket once it quit.
+- The process exits only on a start-up error (invalid ini or NETMAP, the lock
+  is held, NETIO socket cannot be bound). Release builds abort on a panic, so a
+  restart loop around the process (see below) recovers every port instead of
+  leaving one thread dead.
 
 ## Usage
 

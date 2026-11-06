@@ -123,6 +123,9 @@ fn run(args: &Args) -> Result<Infallible, String> {
         Err(e) => return Err(format!("mkdir {dir}: {e}")),
     }
     let path = format!("{dir}/{}", args.id);
+    // Held for the life of the process: a second instance would otherwise
+    // unlink the socket under this one and take it over.
+    let _lock = netio::lock(&path)?;
     match fs::remove_file(&path) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
