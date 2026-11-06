@@ -27,6 +27,11 @@ pub const MSG_DATA: u8 = 1;
 
 /// Largest datagram read from IOL.
 const RX_SPACE: usize = 64 * 1024;
+/// How long a port waits for room in IOL's receive queue before it drops the
+/// frame. The queue holds only `net.unix.max_dgram_qlen` datagrams (10 in a
+/// fresh network namespace), so a burst of broadcasts fills it while IOL is
+/// still reading.
+pub const SEND_TIMEOUT: Duration = Duration::from_millis(100);
 
 pub fn port_byte(slot: u8, port: u8) -> u8 {
     (port << 4) | slot
@@ -151,7 +156,9 @@ impl UnixDest {
     }
 }
 
-/// Sends one datagram without blocking.
+/// Sends one datagram. While IOL's receive queue is full the call waits, up to
+/// the socket's send timeout ([`SEND_TIMEOUT`]); only the calling port's thread
+/// waits.
 pub fn send_to(sock: &UnixDatagram, buf: &[u8], dest: &UnixDest) -> io::Result<()> {
     // SAFETY: buf and dest.addr are valid for the lengths passed.
     let n = unsafe {
@@ -159,7 +166,7 @@ pub fn send_to(sock: &UnixDatagram, buf: &[u8], dest: &UnixDest) -> io::Result<(
             sock.as_raw_fd(),
             buf.as_ptr().cast(),
             buf.len(),
-            libc::MSG_DONTWAIT,
+            0,
             (&dest.addr as *const libc::sockaddr_un).cast(),
             dest.len,
         )
@@ -293,5 +300,46 @@ mod tests {
         drop(other);
         assert!(lock(path).is_ok());
         let _ = std::fs::remove_file(&name);
+    }
+
+    #[test]
+    fn send_waits_for_room() {
+        let dir = std::env::temp_dir().join(format!("netio-send-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rx_path = dir.join("1");
+        let _ = std::fs::remove_file(&rx_path);
+        let rx = UnixDatagram::bind(&rx_path).unwrap();
+        let tx = UnixDatagram::unbound().unwrap();
+        tx.set_write_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let dest = UnixDest::new(rx_path.to_str().unwrap().into()).unwrap();
+        // Nobody reads: once the queue is full, a send waits out the timeout.
+        let mut sent = 0;
+        let err = loop {
+            let t = std::time::Instant::now();
+            match send_to(&tx, &[0u8; 64], &dest) {
+                Ok(()) => sent += 1,
+                Err(e) => break (e, t.elapsed()),
+            }
+            assert!(sent < 100_000, "queue never filled");
+        };
+        assert_eq!(err.0.raw_os_error(), Some(libc::EAGAIN));
+        assert!(
+            err.1 >= Duration::from_millis(40),
+            "gave up after {:?}",
+            err.1
+        );
+        // A reader that drains the queue lets every later send through.
+        let reader = thread::spawn(move || {
+            let mut buf = [0u8; 64];
+            for _ in 0..sent + 1000 {
+                rx.recv(&mut buf).unwrap();
+            }
+        });
+        for _ in 0..1000 {
+            send_to(&tx, &[0u8; 64], &dest).unwrap();
+        }
+        reader.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

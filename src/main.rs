@@ -131,7 +131,10 @@ fn run(args: &Args) -> Result<Infallible, String> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(format!("remove stale {path}: {e}")),
     }
-    let sock = Arc::new(UnixDatagram::bind(&path).map_err(|e| format!("bind {path}: {e}"))?);
+    let sock = UnixDatagram::bind(&path).map_err(|e| format!("bind {path}: {e}"))?;
+    sock.set_write_timeout(Some(netio::SEND_TIMEOUT))
+        .map_err(|e| format!("set send timeout on {path}: {e}"))?;
+    let sock = Arc::new(sock);
 
     // SIGUSR1 is taken with sigwait() below; block it before any thread starts
     // so every thread inherits the mask.

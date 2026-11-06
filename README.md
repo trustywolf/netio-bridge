@@ -29,6 +29,12 @@ IOL ports down for good:
 - Each port has its own thread with an `AF_PACKET` socket bound to the
   interface's ifindex (promiscuous, `PACKET_AUXDATA`, `PACKET_IGNORE_OUTGOING`,
   1 s receive timeout). Frames are sent to IOL with an 8-byte NETIO header.
+  When IOL's receive queue is full, the port's thread waits up to 100 ms for
+  room before it drops the frame. The queue holds `net.unix.max_dgram_qlen`
+  datagrams, only 10 in a container's fresh network namespace, so a burst of
+  broadcasts (an ARP sweep of the management network) fills it while IOL is
+  still reading. Raising the sysctl in the container (Containerlab: `sysctls:`
+  `net.unix.max_dgram_qlen: 512`) also helps the other direction.
 - The kernel strips the outer VLAN tag before a packet socket sees a frame.
   netio-bridge puts it back from `PACKET_AUXDATA`: 802.1Q or 802.1ad TPID as
   reported, priority-tagged frames (VID 0) included.
