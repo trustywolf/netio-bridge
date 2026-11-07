@@ -16,7 +16,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixDatagram;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::log;
 use crate::port::Port;
@@ -32,6 +32,8 @@ const RX_SPACE: usize = 64 * 1024;
 /// fresh network namespace), so a burst of broadcasts fills it while IOL is
 /// still reading.
 pub const SEND_TIMEOUT: Duration = Duration::from_millis(100);
+/// How often [`wait_for_listener`] tries IOL's socket again.
+const LISTEN_POLL: Duration = Duration::from_millis(50);
 
 pub fn port_byte(slot: u8, port: u8) -> u8 {
     (port << 4) | slot
@@ -175,6 +177,25 @@ pub fn send_to(sock: &UnixDatagram, buf: &[u8], dest: &UnixDest) -> io::Result<(
         Err(io::Error::last_os_error())
     } else {
         Ok(())
+    }
+}
+
+/// Waits until a socket is bound at `path` and returns how long that took.
+/// The bridge and IOL start together, so a neighbour's frame can arrive before
+/// IOL has opened its NETIO socket; ports start forwarding only after this.
+/// A `connect()` reaches only a bound socket: it fails with `ENOENT` before IOL
+/// creates the file and with `ECONNREFUSED` while a file left by an earlier
+/// run is still there. Any other answer means a socket is bound.
+pub fn wait_for_listener(path: &str) -> io::Result<Duration> {
+    let start = Instant::now();
+    let probe = UnixDatagram::unbound()?;
+    loop {
+        match probe.connect(path) {
+            Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ECONNREFUSED)) => {
+                thread::sleep(LISTEN_POLL)
+            }
+            _ => return Ok(start.elapsed()),
+        }
     }
 }
 
@@ -340,6 +361,35 @@ mod tests {
             send_to(&tx, &[0u8; 64], &dest).unwrap();
         }
         reader.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn waits_for_a_bound_socket() {
+        let dir = std::env::temp_dir().join(format!("netio-wait-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("1");
+        let _ = std::fs::remove_file(&path);
+        // A file left by an earlier run does not count, nor does a missing one.
+        drop(UnixDatagram::bind(&path).unwrap());
+        assert!(path.exists());
+        let binder = {
+            let path = path.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(200));
+                std::fs::remove_file(&path).unwrap();
+                thread::sleep(Duration::from_millis(200));
+                UnixDatagram::bind(&path).unwrap()
+            })
+        };
+        let waited = wait_for_listener(path.to_str().unwrap()).unwrap();
+        let _rx = binder.join().unwrap();
+        assert!(
+            waited >= Duration::from_millis(400),
+            "returned after {waited:?}"
+        );
+        // Once bound, it returns at once.
+        assert!(wait_for_listener(path.to_str().unwrap()).unwrap() < LISTEN_POLL);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

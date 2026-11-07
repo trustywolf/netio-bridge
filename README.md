@@ -35,6 +35,11 @@ IOL ports down for good:
   broadcasts (an ARP sweep of the management network) fills it while IOL is
   still reading. Raising the sysctl in the container (Containerlab: `sysctls:`
   `net.unix.max_dgram_qlen: 512`) also helps the other direction.
+- The bridge and IOL start together, so a neighbour's frame can arrive before
+  IOL has opened its NETIO socket. The port threads start only once a
+  `connect()` to IOL's socket succeeds: `ENOENT` (no file yet) and
+  `ECONNREFUSED` (a file left by an earlier run, as after a container restart)
+  mean IOL is not listening yet, and the bridge tries again every 50 ms.
 - The kernel strips the outer VLAN tag before a packet socket sees a frame.
   netio-bridge puts it back from `PACKET_AUXDATA`: 802.1Q or 802.1ad TPID as
   reported, priority-tagged frames (VID 0) included.

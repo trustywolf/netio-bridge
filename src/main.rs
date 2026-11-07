@@ -147,6 +147,18 @@ fn run(args: &Args) -> Result<Infallible, String> {
         set
     };
 
+    let mut iol_ids: Vec<u16> = cfg.ports.iter().map(|p| p.iol_id).collect();
+    iol_ids.sort_unstable();
+    iol_ids.dedup();
+    for iol_id in iol_ids {
+        let iol = format!("{dir}/{iol_id}");
+        let waited = netio::wait_for_listener(&iol).map_err(|e| format!("probe {iol}: {e}"))?;
+        log::info(&format!(
+            "IOL {iol_id} listening on {iol} after {} ms",
+            waited.as_millis()
+        ));
+    }
+
     let ports: Arc<Vec<Port>> = Arc::new(cfg.ports.into_iter().map(Port::new).collect());
     let unix_stats = Arc::new(UnixStats::default());
     for i in 0..ports.len() {
