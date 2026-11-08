@@ -2,12 +2,12 @@
 
 netio-bridge connects the Ethernet ports of a Cisco IOL (IOS on Linux) instance
 to Linux network interfaces. It is a small replacement for `iouyap` in
-[Containerlab](https://containerlab.dev) IOL images: it reads the same
-`iouyap.ini` and `NETMAP` files Containerlab writes, and supports only what
-Containerlab uses, one Linux interface per IOL port.
+[Containerlab](https://containerlab.dev) IOL images, and works only there: it
+takes the port layout from what Containerlab gives the node and bridges one
+Linux interface per IOL port.
 
-It is an independent implementation written in Rust. It accepts the iouyap
-configuration format but contains no iouyap code.
+It is an independent implementation written in Rust and contains no iouyap
+code.
 
 ## Why
 
@@ -59,19 +59,20 @@ IOL ports down for good:
   its PID into it. A second instance (say, one started by hand for debugging)
   exits with an error instead of unlinking the socket and taking it over, which
   would leave IOL sending to a dead socket once it quit.
-- The process exits only on a start-up error (invalid ini or NETMAP, the lock
-  is held, NETIO socket cannot be bound). Release builds abort on a panic, so a
+- The process exits only on a start-up error (invalid NETMAP or Containerlab
+  variables, the lock is held, NETIO socket cannot be bound). Release builds abort on a panic, so a
   restart loop around the process (see below) recovers every port instead of
   leaving one thread dead.
 
 ## Usage
 
 ```text
-netio-bridge <appl_id> [-q] [-c <ini file>] [-l <log file>]
+netio-bridge <appl_id> [--prepare] [-q] [-l <log file>]
 
   <appl_id>      NETIO id of the bridge (Containerlab uses 513)
+  --prepare      wait for the links, write /iol/NETMAP with every port of
+                 every slot and print the slot count (for iol.bin -e)
   -q             quiet: leave out start-up messages
-  -c <ini file>  default /iol/iouyap.ini
   -l <log file>  default /tmp/netio-bridge.log
 ```
 
@@ -81,38 +82,38 @@ the router console. The log holds start-up messages (`INFO`, left out with
 and port every ten seconds, with a count of the ones held back). Send `SIGUSR1`
 to write the traffic and drop counters to the log.
 
-### Configuration
+### Port layout
 
-The subset Containerlab generates:
+IOL reads `NETMAP` once, at boot, and uses only the ports listed there, while
+Containerlab lists only the ports that have links (on a config-drift recreate,
+only the management port). So `--prepare`, run before IOL starts:
 
-```ini
-[default]
-base_port = 49000
-netmap = /iol/NETMAP
-[513:0/0]
-eth_dev = eth0
-[513:0/1]
-eth_dev = eth1
-```
+- waits 5 s for Containerlab to add the node's links;
+- takes `CLAB_IOL_NUM_SLOTS` slots when it is set, else enough slots for the
+  highest of our ports in Containerlab's `/iol/NETMAP` (written before the
+  start, so it lists links that are not back yet after a crash) and for the
+  highest-numbered `eth` interface present;
+- rewrites `/iol/NETMAP` with every port of every slot, each wired to the same
+  port of IOL (`IOL_PID`), and prints the slot count.
 
-```text
-1:0/0 513:0/0
-1:0/1 513:0/1
-```
+The bridge then reads `/iol/NETMAP` back and serves `<slot>/<port>` on
+`eth<4 x slot + port>`, except that the management port swaps interfaces with
+`Ethernet0/0`, so `eth0` is always management. The management port is the one
+`CLAB_IOL_MGMT_INTF` names (Containerlab 0.83 and later), else the one
+Containerlab's `/iol/iouyap.ini` gives `eth0`, else `Ethernet0/0`. A link added
+later to a running node then works too, and a restarted bridge serves exactly
+the ports IOL booted with.
 
-- Sections `[<appl_id>:<slot>/<port>]` need `eth_dev`; other keys and sections
-  for other ids are ignored. A relative `netmap` path is taken relative to the
-  ini file; without one, `NETMAP` next to the ini file is used.
-- NETMAP: `#` starts a comment, an `@host` suffix is ignored, lines that do not
-  involve `<appl_id>` are ignored. Slot and port must be below 16.
-- Each of our ports must appear in exactly one NETMAP line with exactly one IOL
-  endpoint. Segments (more than two members), duplicate mappings, one interface
-  on two ports, or a port with no NETMAP line stop the bridge at start-up.
+`--prepare` stops with an error, and the entrypoint should not start IOL, when
+`IOL_PID`, `CLAB_IOL_NUM_SLOTS` or `CLAB_IOL_MGMT_INTF` is invalid or the
+management port lies beyond the slots. The bridge stops at start-up when
+`/iol/NETMAP` is missing, maps one of our ports twice or has a line that is not
+a point-to-point link between one of our ports and one IOL port.
 
 ### In a Containerlab IOL image
 
-Build it from source in a builder stage and start it from the entrypoint in a
-restart loop, before IOL:
+Build it from source in a builder stage. In the entrypoint, run `--prepare`,
+start the bridge in a restart loop, then IOL:
 
 ```dockerfile
 FROM ubuntu:resolute AS netio-bridge-build
@@ -129,6 +130,7 @@ COPY --from=netio-bridge-build /src/target/release/netio-bridge /usr/bin/netio-b
 ```
 
 ```bash
+num_slots=$(/usr/bin/netio-bridge 513 --prepare) || exit 1
 ( while :; do /usr/bin/netio-bridge 513 -q; sleep 1; done ) &
 exec /iol/iol.bin $IOL_PID -e $num_slots -s 0 -c config.txt -n 1024
 ```
@@ -139,7 +141,8 @@ The container must be allowed to open packet sockets and set promiscuous mode
 ## Limitations
 
 - Linux only (`AF_PACKET`).
-- Only `eth_dev` ports. No UDP tunnels, TAP devices, pcap capture, port
+- Only Containerlab's layout: one `eth` interface per port, IOL wired to
+  `<appl_id>` port for port. No UDP tunnels, TAP devices, pcap capture, port
   mirroring or multi-member segments.
 - Frames longer than 9220 bytes are dropped. Such frames come from the Linux
   stack with GSO/TSO, for example when testing with a host process on a veth

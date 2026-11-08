@@ -1,6 +1,6 @@
 //! netio-bridge: connects the Ethernet ports of a Cisco IOL instance (NETIO
-//! datagrams on Unix sockets) to Linux network interfaces, using the
-//! iouyap-style `iouyap.ini` and `NETMAP` files that Containerlab writes.
+//! datagrams on Unix sockets) to Linux network interfaces, in a Containerlab
+//! IOL node.
 
 #[cfg(not(target_os = "linux"))]
 compile_error!("netio-bridge supports Linux only (AF_PACKET)");
@@ -22,29 +22,34 @@ use std::process::ExitCode;
 use std::ptr;
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 use port::Port;
 use stats::UnixStats;
 
 const USAGE: &str = "\
-usage: netio-bridge <appl_id> [-q] [-c <ini file>] [-l <log file>]
+usage: netio-bridge <appl_id> [--prepare] [-q] [-l <log file>]
 
-Bridges IOL Ethernet ports to Linux interfaces, as mapped by an iouyap-style
-ini file ([<appl_id>:<slot>/<port>] sections with eth_dev) and its NETMAP.
+Bridges the Ethernet ports of a Containerlab IOL node to its eth interfaces.
+Run it with --prepare before IOL starts, then without, beside IOL.
 
   <appl_id>      NETIO id of the bridge (Containerlab uses 513)
+  --prepare      wait for the links, write /iol/NETMAP with every port of
+                 every slot and print the slot count (for iol.bin -e)
   -q             quiet: leave out start-up messages
-  -c <ini file>  default /iol/iouyap.ini
   -l <log file>  default /tmp/netio-bridge.log
   -h, --help     show this help
   -V, --version  show the version
 
 Send SIGUSR1 to write the traffic and drop counters to the log.";
 
+/// How long --prepare waits for Containerlab to add the node's links.
+const PREPARE_WAIT: Duration = Duration::from_secs(5);
+
 struct Args {
     id: u16,
+    prepare: bool,
     quiet: bool,
-    ini: PathBuf,
     log: PathBuf,
 }
 
@@ -55,8 +60,8 @@ enum Cli {
 
 fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Cli, String> {
     let mut id = None;
+    let mut prepare = false;
     let mut quiet = false;
-    let mut ini = PathBuf::from("/iol/iouyap.ini");
     let mut log = PathBuf::from("/tmp/netio-bridge.log");
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -68,8 +73,8 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Cli, String> {
                 println!("netio-bridge {}", env!("CARGO_PKG_VERSION"));
                 return Ok(Cli::Exit(ExitCode::SUCCESS));
             }
+            "--prepare" => prepare = true,
             "-q" => quiet = true,
-            "-c" => ini = args.next().ok_or("-c needs a file")?.into(),
             "-l" => log = args.next().ok_or("-l needs a file")?.into(),
             s if s.starts_with('-') => return Err(format!("unknown option {s}")),
             s if id.is_none() => match s.parse::<u16>() {
@@ -82,8 +87,8 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Cli, String> {
     let id = id.ok_or("missing appl_id")?;
     Ok(Cli::Run(Args {
         id,
+        prepare,
         quiet,
-        ini,
         log,
     }))
 }
@@ -99,6 +104,27 @@ fn main() -> ExitCode {
         }
     };
     log::init(&args.log, args.quiet);
+    if args.prepare {
+        // Runs before IOL, from the entrypoint: stdout carries the slot count,
+        // and stderr reaches the container log.
+        thread::sleep(PREPARE_WAIT);
+        return match config::prepare(args.id) {
+            Ok(slots) => {
+                log::info(&format!(
+                    "netio-bridge {} prepared {} with {slots} slot(s)",
+                    env!("CARGO_PKG_VERSION"),
+                    config::NETMAP
+                ));
+                println!("{slots}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                log::error("fatal", &format!("prepare: {e}"));
+                eprintln!("netio-bridge: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let Err(e) = run(&args);
     log::error("fatal", &format!("fatal: {e}"));
     ExitCode::FAILURE
@@ -106,16 +132,13 @@ fn main() -> ExitCode {
 
 /// Returns only on a start-up error; once bridging, runs forever.
 fn run(args: &Args) -> Result<Infallible, String> {
-    let cfg = config::load(&args.ini, args.id).map_err(|e| e.to_string())?;
+    let ports = config::load(args.id).map_err(|e| e.to_string())?;
     log::info(&format!(
         "netio-bridge {} starting as {} with {}",
         env!("CARGO_PKG_VERSION"),
         args.id,
-        args.ini.display()
+        config::NETMAP
     ));
-    for w in &cfg.warnings {
-        log::notice(w);
-    }
 
     let dir = netio::socket_dir();
     match fs::create_dir(&dir) {
@@ -148,7 +171,7 @@ fn run(args: &Args) -> Result<Infallible, String> {
         set
     };
 
-    let mut iol_ids: Vec<u16> = cfg.ports.iter().map(|p| p.iol_id).collect();
+    let mut iol_ids: Vec<u16> = ports.iter().map(|p| p.iol_id).collect();
     iol_ids.sort_unstable();
     iol_ids.dedup();
     for iol_id in iol_ids {
@@ -161,8 +184,7 @@ fn run(args: &Args) -> Result<Infallible, String> {
     }
 
     let watcher = link::Watcher::open().map_err(|e| format!("rtnetlink socket: {e}"))?;
-    let ports = cfg
-        .ports
+    let ports = ports
         .into_iter()
         .map(Port::new)
         .collect::<io::Result<Vec<_>>>()
@@ -217,15 +239,12 @@ mod tests {
         let Ok(Cli::Run(a)) = parse(&["513", "-q"]) else {
             panic!()
         };
-        assert_eq!(a.id, 513);
-        assert!(a.quiet);
-        assert_eq!(a.ini, PathBuf::from("/iol/iouyap.ini"));
+        assert_eq!((a.id, a.prepare, a.quiet), (513, false, true));
         assert_eq!(a.log, PathBuf::from("/tmp/netio-bridge.log"));
-        let Ok(Cli::Run(a)) = parse(&["-c", "/x.ini", "513", "-l", "/y.log"]) else {
+        let Ok(Cli::Run(a)) = parse(&["--prepare", "513", "-l", "/y.log"]) else {
             panic!()
         };
-        assert_eq!((a.id, a.quiet), (513, false));
-        assert_eq!(a.ini, PathBuf::from("/x.ini"));
+        assert_eq!((a.id, a.prepare, a.quiet), (513, true, false));
         assert_eq!(a.log, PathBuf::from("/y.log"));
     }
 
@@ -236,6 +255,8 @@ mod tests {
         assert!(parse(&["70000"]).is_err());
         assert!(parse(&["513", "514"]).is_err());
         assert!(parse(&["513", "-x"]).is_err());
-        assert!(parse(&["513", "-c"]).is_err());
+        assert!(parse(&["513", "-l"]).is_err());
+        // The ini file option is gone: the layout comes from Containerlab.
+        assert!(parse(&["513", "-c", "/x.ini"]).is_err());
     }
 }

@@ -1,27 +1,32 @@
-//! Reads the bridge configuration: an iouyap-style ini file and the NETMAP it
-//! points to.
+//! The port layout of a Containerlab IOL node.
 //!
-//! Only the subset Containerlab writes is accepted:
-//!
-//! ```text
-//! [default]
-//! base_port = 49000
-//! netmap = /iol/NETMAP
-//! [513:0/0]
-//! eth_dev = eth0
-//! ```
-//!
-//! and NETMAP lines of exactly two endpoints, one of them ours:
+//! Containerlab starts the node with `IOL_PID` (IOL's NETIO id), optionally
+//! `CLAB_IOL_NUM_SLOTS` and `CLAB_IOL_MGMT_INTF`, and writes `/iol/iouyap.ini`
+//! and `/iol/NETMAP` for the ports that have links. IOL reads NETMAP once, at
+//! boot, and uses only the ports listed there, so before IOL starts,
+//! [`prepare`] rewrites NETMAP with every port of every slot:
 //!
 //! ```text
 //! 1:0/0 513:0/0
+//! 1:0/1 513:0/1
 //! ```
+//!
+//! Port `<slot>/<port>` is bridged to `eth<4 x slot + port>`, except that the
+//! management port and `Ethernet0/0` swap interfaces: `eth0` is always the
+//! management port. [`load`] reads the NETMAP back, so a restarted bridge
+//! serves exactly the ports IOL booted with.
 
 use std::fmt;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::io;
 
 use crate::netio;
+
+pub const NETMAP: &str = "/iol/NETMAP";
+pub const IOUYAP_INI: &str = "/iol/iouyap.ini";
+const SYS_NET: &str = "/sys/class/net";
+const PORTS_PER_SLOT: u8 = 4;
+const MAX_SLOTS: u8 = 16;
 
 /// One bridged port: `Ethernet<slot>/<port>` of our id, the Linux interface
 /// behind it and the IOL endpoint it is wired to.
@@ -42,13 +47,6 @@ impl PortConfig {
     pub fn name(&self) -> String {
         format!("{}/{}", self.slot, self.port)
     }
-}
-
-#[derive(Debug)]
-pub struct Config {
-    pub ports: Vec<PortConfig>,
-    /// Problems that do not stop the bridge.
-    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -79,99 +77,123 @@ fn parse_endpoint(s: &str) -> Option<Endpoint> {
     let id: u16 = id.trim().parse().ok()?;
     let slot: u8 = slot.trim().parse().ok()?;
     let port: u8 = port.trim().parse().ok()?;
-    if id == 0 || slot >= 16 || port >= 16 {
+    if id == 0 || slot >= MAX_SLOTS || port >= PORTS_PER_SLOT {
         return None;
     }
     Some(Endpoint { id, slot, port })
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
-struct Ini {
-    netmap: Option<String>,
-    /// (slot, port, eth_dev) for every `[<id>:slot/port]` section of ours.
-    ports: Vec<(u8, u8, String)>,
+/// What Containerlab gives the node, besides its interfaces.
+#[derive(Debug, Default)]
+pub struct Clab {
+    /// `IOL_PID`.
+    pub iol_id: Option<String>,
+    /// `CLAB_IOL_NUM_SLOTS`.
+    pub num_slots: Option<String>,
+    /// `CLAB_IOL_MGMT_INTF`, such as `Ethernet1/2`.
+    pub mgmt_intf: Option<String>,
+    /// Containerlab's `/iol/iouyap.ini`, empty if there is none.
+    pub iouyap_ini: String,
 }
 
-enum Section {
-    None,
-    Default,
-    Own(usize),
-    Other,
-}
+impl Clab {
+    pub fn from_env() -> Self {
+        let var = |k| std::env::var(k).ok().filter(|v: &String| !v.is_empty());
+        Clab {
+            iol_id: var("IOL_PID"),
+            num_slots: var("CLAB_IOL_NUM_SLOTS"),
+            mgmt_intf: var("CLAB_IOL_MGMT_INTF"),
+            iouyap_ini: fs::read_to_string(IOUYAP_INI).unwrap_or_default(),
+        }
+    }
 
-fn parse_ini(text: &str, id: u16) -> Result<Ini, ConfigError> {
-    let mut netmap = None;
-    let mut own: Vec<(u8, u8, Option<String>)> = Vec::new();
-    let mut section = Section::None;
-    for (n, raw) in text.lines().enumerate() {
-        let n = n + 1;
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
-            continue;
+    /// The management port: the one `CLAB_IOL_MGMT_INTF` names (Containerlab
+    /// 0.83 and later), else the one Containerlab's `iouyap.ini` gives `eth0`,
+    /// else `Ethernet0/0`.
+    pub fn mgmt_port(&self, id: u16) -> Result<(u8, u8), ConfigError> {
+        if let Some(m) = &self.mgmt_intf {
+            return m
+                .strip_prefix("Ethernet")
+                .and_then(|sp| parse_endpoint(&format!("1:{sp}")))
+                .map(|e| (e.slot, e.port))
+                .ok_or_else(|| ConfigError(format!("bad CLAB_IOL_MGMT_INTF {m}")));
         }
-        if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
-            let name = name.trim();
-            section = if name == "default" {
-                Section::Default
-            } else {
-                let Some(ep) = parse_endpoint(name) else {
-                    return err(format!("ini line {n}: bad section [{name}]"));
-                };
-                if ep.id != id {
-                    Section::Other
-                } else if own.iter().any(|(s, p, _)| (*s, *p) == (ep.slot, ep.port)) {
-                    return err(format!("ini line {n}: duplicate section [{name}]"));
-                } else {
-                    own.push((ep.slot, ep.port, None));
-                    Section::Own(own.len() - 1)
+        let mut section = None;
+        for line in self.iouyap_ini.lines().map(str::trim) {
+            if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+                section = parse_endpoint(name).filter(|e| e.id == id);
+            } else if let (Some(e), Some((k, v))) = (section, line.split_once('=')) {
+                if k.trim() == "eth_dev" && v.trim() == "eth0" {
+                    return Ok((e.slot, e.port));
                 }
-            };
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            return err(format!("ini line {n}: expected key = value"));
-        };
-        let (key, value) = (key.trim(), value.trim());
-        match section {
-            Section::None => return err(format!("ini line {n}: key outside any section")),
-            Section::Default if key == "netmap" => netmap = Some(value.to_string()),
-            Section::Own(i) if key == "eth_dev" => {
-                if own[i].2.is_some() {
-                    return err(format!("ini line {n}: duplicate eth_dev"));
-                }
-                if value.is_empty() {
-                    return err(format!("ini line {n}: empty eth_dev"));
-                }
-                own[i].2 = Some(value.to_string());
             }
-            _ => {}
         }
+        Ok((0, 0))
     }
-    let mut ports = Vec::new();
-    for (slot, port, dev) in own {
-        let Some(dev) = dev else {
-            return err(format!(
-                "ini section [{id}:{slot}/{port}] has no eth_dev (only eth_dev ports are supported)"
-            ));
-        };
-        if ports.iter().any(|(_, _, d)| *d == dev) {
-            return err(format!("ini: {dev} is mapped to more than one port"));
-        }
-        ports.push((slot, port, dev));
-    }
-    Ok(Ini { netmap, ports })
 }
 
-/// A NETMAP link between one of our ports and an IOL port.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Link {
-    own: Endpoint,
-    peer: Endpoint,
+fn index(slot: u8, port: u8) -> usize {
+    usize::from(slot) * usize::from(PORTS_PER_SLOT) + usize::from(port)
 }
 
-fn parse_netmap(text: &str, id: u16) -> Result<Vec<Link>, ConfigError> {
-    let mut links: Vec<Link> = Vec::new();
-    for (n, raw) in text.lines().enumerate() {
+/// The slot count for IOL's `-e`: `CLAB_IOL_NUM_SLOTS` when set, else enough
+/// for the highest of our ports in Containerlab's NETMAP (written before the
+/// start, so it lists links that are not back yet after a crash) and for the
+/// highest `eth<n>` interface present.
+pub fn slot_count(
+    clab: &Clab,
+    id: u16,
+    netmap: &str,
+    ifnames: &[String],
+) -> Result<u8, ConfigError> {
+    let slots = match &clab.num_slots {
+        Some(s) => match s.trim().parse::<u8>() {
+            Ok(n) if (1..=MAX_SLOTS).contains(&n) => n,
+            _ => return err(format!("bad CLAB_IOL_NUM_SLOTS {s}")),
+        },
+        None => {
+            let from_netmap = netmap
+                .split_whitespace()
+                .filter_map(parse_endpoint)
+                .filter(|e| e.id == id)
+                .map(|e| e.slot + 1)
+                .max()
+                .unwrap_or(1);
+            let from_eth = ifnames
+                .iter()
+                .filter_map(|n| n.strip_prefix("eth")?.parse::<usize>().ok())
+                .map(|n| n / usize::from(PORTS_PER_SLOT) + 1)
+                .max()
+                .unwrap_or(1);
+            from_netmap.max(from_eth.min(usize::from(MAX_SLOTS)) as u8)
+        }
+    };
+    let (s, p) = clab.mgmt_port(id)?;
+    if s >= slots {
+        return err(format!(
+            "management port Ethernet{s}/{p} is beyond the {slots} slot(s)"
+        ));
+    }
+    Ok(slots)
+}
+
+/// NETMAP with every port of `slots` slots, each wired to the same port of IOL.
+pub fn netmap_text(iol_id: u16, id: u16, slots: u8) -> String {
+    let mut s = String::new();
+    for slot in 0..slots {
+        for port in 0..PORTS_PER_SLOT {
+            s.push_str(&format!("{iol_id}:{slot}/{port} {id}:{slot}/{port}\n"));
+        }
+    }
+    s
+}
+
+/// The ports a NETMAP gives us, each with its interface. Only point-to-point
+/// lines between one of our ports and one IOL port are accepted.
+pub fn ports(netmap: &str, id: u16, mgmt: (u8, u8)) -> Result<Vec<PortConfig>, ConfigError> {
+    let mgmt = index(mgmt.0, mgmt.1);
+    let mut ports: Vec<PortConfig> = Vec::new();
+    for (n, raw) in netmap.lines().enumerate() {
         let n = n + 1;
         let line = raw.split('#').next().unwrap_or("").trim();
         if line.is_empty() {
@@ -198,66 +220,69 @@ fn parse_netmap(text: &str, id: u16) -> Result<Vec<Link>, ConfigError> {
         } else {
             (eps[1], eps[0])
         };
-        if links.iter().any(|l| l.own == own) {
+        if ports
+            .iter()
+            .any(|p| (p.slot, p.port) == (own.slot, own.port))
+        {
             return err(format!(
                 "NETMAP line {n}: {id}:{}/{} is mapped more than once",
                 own.slot, own.port
             ));
         }
-        links.push(Link { own, peer });
-    }
-    Ok(links)
-}
-
-fn join(ini: Ini, links: &[Link], id: u16) -> Result<Config, ConfigError> {
-    let mut ports = Vec::new();
-    for (slot, port, ifname) in ini.ports {
-        let Some(link) = links
-            .iter()
-            .find(|l| (l.own.slot, l.own.port) == (slot, port))
-        else {
-            return err(format!("{id}:{slot}/{port} ({ifname}) has no NETMAP entry"));
+        let i = index(own.slot, own.port);
+        let eth = match i {
+            0 => mgmt,
+            _ if i == mgmt => 0,
+            _ => i,
         };
         ports.push(PortConfig {
-            slot,
-            port,
-            ifname,
-            iol_id: link.peer.id,
-            iol_port: netio::port_byte(link.peer.slot, link.peer.port),
+            slot: own.slot,
+            port: own.port,
+            ifname: format!("eth{eth}"),
+            iol_id: peer.id,
+            iol_port: netio::port_byte(peer.slot, peer.port),
         });
     }
     if ports.is_empty() {
-        return err(format!("no [{id}:slot/port] sections in the ini file"));
+        return err(format!("NETMAP has no port of {id}"));
     }
-    let warnings = links
-        .iter()
-        .filter(|l| {
-            !ports
-                .iter()
-                .any(|p| (p.slot, p.port) == (l.own.slot, l.own.port))
-        })
-        .map(|l| {
-            format!(
-                "NETMAP maps {id}:{}/{} but the ini file has no section for it; ignored",
-                l.own.slot, l.own.port
-            )
-        })
-        .collect();
-    Ok(Config { ports, warnings })
+    Ok(ports)
 }
 
-/// Loads the ini file and its NETMAP. A relative `netmap` path is taken
-/// relative to the ini file; without one, `NETMAP` next to the ini file is used.
-pub fn load(ini_path: &Path, id: u16) -> Result<Config, ConfigError> {
-    let text =
-        fs::read_to_string(ini_path).or_else(|e| err(format!("{}: {e}", ini_path.display())))?;
-    let ini = parse_ini(&text, id)?;
-    let dir = ini_path.parent().unwrap_or(Path::new("."));
-    let netmap_path: PathBuf = dir.join(ini.netmap.as_deref().unwrap_or("NETMAP"));
-    let text = fs::read_to_string(&netmap_path)
-        .or_else(|e| err(format!("{}: {e}", netmap_path.display())))?;
-    let links = parse_netmap(&text, id)?;
-    join(ini, &links, id)
+fn read(path: &str) -> Result<String, ConfigError> {
+    fs::read_to_string(path).or_else(|e| err(format!("{path}: {e}")))
+}
+
+/// Before IOL starts: picks the slot count, writes NETMAP with every port and
+/// returns the count.
+pub fn prepare(id: u16) -> Result<u8, ConfigError> {
+    let clab = Clab::from_env();
+    let Some(iol_id) = clab.iol_id.as_deref() else {
+        return err("IOL_PID is not set".into());
+    };
+    let iol_id = match iol_id.parse::<u16>() {
+        Ok(n) if n > 0 && n != id => n,
+        _ => return err(format!("bad IOL_PID {iol_id}")),
+    };
+    let netmap = match fs::read_to_string(NETMAP) {
+        Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(e) => return err(format!("{NETMAP}: {e}")),
+    };
+    let ifnames: Vec<String> = fs::read_dir(SYS_NET)
+        .or_else(|e| err(format!("{SYS_NET}: {e}")))?
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .collect();
+    let slots = slot_count(&clab, id, &netmap, &ifnames)?;
+    fs::write(NETMAP, netmap_text(iol_id, id, slots))
+        .or_else(|e| err(format!("write {NETMAP}: {e}")))?;
+    Ok(slots)
+}
+
+/// The ports to bridge, from the NETMAP [`prepare`] wrote.
+pub fn load(id: u16) -> Result<Vec<PortConfig>, ConfigError> {
+    let clab = Clab::from_env();
+    ports(&read(NETMAP)?, id, clab.mgmt_port(id)?)
 }
 
 #[cfg(test)]
@@ -266,12 +291,20 @@ mod tests {
 
     const CLAB_INI: &str = "[default]\nbase_port = 49000\nnetmap = /iol/NETMAP\n\
         [513:0/0]\neth_dev = eth0\n[513:0/1]\neth_dev = eth1\n[513:1/0]\neth_dev = eth4\n";
-    const CLAB_NETMAP: &str = "1:0/0 513:0/0\n1:0/1 513:0/1\n1:1/0 513:1/0\n";
 
-    fn parse(ini: &str, netmap: &str) -> Result<Config, ConfigError> {
-        let ini = parse_ini(ini, 513)?;
-        let links = parse_netmap(netmap, 513)?;
-        join(ini, &links, 513)
+    fn clab(slots: Option<&str>, mgmt: Option<&str>, ini: &str) -> Clab {
+        Clab {
+            iol_id: Some("1".into()),
+            num_slots: slots.map(Into::into),
+            mgmt_intf: mgmt.map(Into::into),
+            iouyap_ini: ini.into(),
+        }
+    }
+
+    fn eths(n: &[usize]) -> Vec<String> {
+        let mut v: Vec<String> = n.iter().map(|i| format!("eth{i}")).collect();
+        v.push("lo".into());
+        v
     }
 
     #[test]
@@ -293,140 +326,142 @@ mod tests {
             })
         );
         assert_eq!(parse_endpoint("513:16/0"), None);
-        assert_eq!(parse_endpoint("513:0/16"), None);
+        assert_eq!(parse_endpoint("513:0/4"), None);
         assert_eq!(parse_endpoint("0:0/0"), None);
         assert_eq!(parse_endpoint("513:0"), None);
         assert_eq!(parse_endpoint("x:0/0"), None);
     }
 
     #[test]
-    fn containerlab_files() {
-        let c = parse(CLAB_INI, CLAB_NETMAP).unwrap();
-        assert!(c.warnings.is_empty());
+    fn mgmt_port_sources() {
+        // Default: Ethernet0/0, with or without Containerlab's ini.
+        assert_eq!(clab(None, None, "").mgmt_port(513), Ok((0, 0)));
+        assert_eq!(clab(None, None, CLAB_INI).mgmt_port(513), Ok((0, 0)));
+        // mgmt-intf: Ethernet1/2 in Containerlab's ini (before 0.83).
+        let ini = "[default]\nnetmap = /iol/NETMAP\n[513:1/2]\neth_dev = eth0\n\
+            [513:0/1]\neth_dev = eth1\n[514:0/0]\neth_dev = eth0\n";
+        assert_eq!(clab(None, None, ini).mgmt_port(513), Ok((1, 2)));
+        // Another id's eth0 does not count.
         assert_eq!(
-            c.ports,
-            vec![
-                PortConfig {
-                    slot: 0,
-                    port: 0,
-                    ifname: "eth0".into(),
-                    iol_id: 1,
-                    iol_port: 0x00
-                },
-                PortConfig {
-                    slot: 0,
-                    port: 1,
-                    ifname: "eth1".into(),
-                    iol_id: 1,
-                    iol_port: 0x10
-                },
-                PortConfig {
-                    slot: 1,
-                    port: 0,
-                    ifname: "eth4".into(),
-                    iol_id: 1,
-                    iol_port: 0x01
-                },
-            ]
+            clab(None, None, "[514:1/1]\neth_dev = eth0\n").mgmt_port(513),
+            Ok((0, 0))
         );
+        // The variable wins over the ini (a recreate may leave a stale one).
         assert_eq!(
-            parse_ini(CLAB_INI, 513).unwrap().netmap.as_deref(),
-            Some("/iol/NETMAP")
+            clab(None, Some("Ethernet0/3"), ini).mgmt_port(513),
+            Ok((0, 3))
         );
+        assert!(clab(None, Some("Gi1"), "").mgmt_port(513).is_err());
+        assert!(clab(None, Some("Ethernet0/4"), "").mgmt_port(513).is_err());
     }
 
     #[test]
-    fn relocated_mgmt_port() {
-        // mgmt-intf: Ethernet1/2 swaps eth0 and eth6.
-        let ini = "[default]\nbase_port = 49000\nnetmap = /iol/NETMAP\n\
-            [513:1/2]\neth_dev = eth0\n[513:0/1]\neth_dev = eth1\n[513:0/0]\neth_dev = eth6\n";
-        let netmap = "7:1/2 513:1/2\n7:0/1 513:0/1\n7:0/0 513:0/0\n";
-        let c = parse(ini, netmap).unwrap();
-        assert_eq!(c.ports[0].ifname, "eth0");
-        assert_eq!(c.ports[0].port_byte(), 0x21);
-        assert_eq!(c.ports[0].iol_port, 0x21);
-        assert_eq!(c.ports[0].iol_id, 7);
-        assert_eq!(c.ports[2].ifname, "eth6");
-        assert_eq!(c.ports[2].port_byte(), 0x00);
+    fn slots_from_netmap_and_interfaces() {
+        let c = clab(None, None, CLAB_INI);
+        let netmap = "1:0/0 513:0/0\n1:0/1 513:0/1\n";
+        // eth0 to eth3: one slot.
+        assert_eq!(slot_count(&c, 513, netmap, &eths(&[0, 1, 2, 3])), Ok(1));
+        // eth4 is Ethernet1/0: two slots.
+        assert_eq!(slot_count(&c, 513, netmap, &eths(&[0, 1, 4])), Ok(2));
+        // A node started after a crash, before its links are back: NETMAP
+        // still lists 1/1, so it keeps two slots with only eth0 present.
+        let netmap = "1:0/0 513:0/0\n1:0/1 513:0/1\n1:1/0 513:1/0\n1:1/1 513:1/1\n";
+        assert_eq!(slot_count(&c, 513, netmap, &eths(&[0])), Ok(2));
+        // A config-drift recreate: NETMAP with eth0 only, the links present.
+        assert_eq!(
+            slot_count(&c, 513, "1:0/0 513:0/0\n", &eths(&[0, 1, 5])),
+            Ok(2)
+        );
+        // Nothing at all still gives one slot.
+        assert_eq!(slot_count(&c, 513, "", &[]), Ok(1));
+        // Other ids in NETMAP do not count.
+        assert_eq!(slot_count(&c, 513, "1:3/0 7:3/0\n", &eths(&[0])), Ok(1));
+    }
+
+    #[test]
+    fn slots_pinned() {
+        let c = clab(Some("3"), None, "");
+        assert_eq!(slot_count(&c, 513, "", &eths(&[0, 1])), Ok(3));
+        // Pinned below what the links need: the pin still wins.
+        let c = clab(Some("1"), None, "");
+        assert_eq!(slot_count(&c, 513, "", &eths(&[0, 4])), Ok(1));
+        for bad in ["0", "17", "x", "-1"] {
+            assert!(slot_count(&clab(Some(bad), None, ""), 513, "", &[]).is_err());
+        }
+        // The management port must exist.
+        let c = clab(Some("1"), Some("Ethernet1/2"), "");
+        assert!(slot_count(&c, 513, "", &eths(&[0])).is_err());
+        let c = clab(None, Some("Ethernet1/2"), "");
+        assert_eq!(slot_count(&c, 513, "1:1/2 513:1/2\n", &eths(&[0])), Ok(2));
+    }
+
+    #[test]
+    fn full_netmap() {
+        assert_eq!(
+            netmap_text(1, 513, 1),
+            "1:0/0 513:0/0\n1:0/1 513:0/1\n1:0/2 513:0/2\n1:0/3 513:0/3\n"
+        );
+        assert_eq!(netmap_text(7, 513, 2).lines().count(), 8);
+        assert!(netmap_text(7, 513, 2).ends_with("7:1/3 513:1/3\n"));
+    }
+
+    #[test]
+    fn ports_from_full_netmap() {
+        let p = ports(&netmap_text(1, 513, 2), 513, (0, 0)).unwrap();
+        assert_eq!(p.len(), 8);
+        assert_eq!(
+            p[5],
+            PortConfig {
+                slot: 1,
+                port: 1,
+                ifname: "eth5".into(),
+                iol_id: 1,
+                iol_port: 0x11
+            }
+        );
+        for (i, port) in p.iter().enumerate() {
+            assert_eq!(port.ifname, format!("eth{i}"));
+            assert_eq!(port.port_byte(), port.iol_port);
+        }
+    }
+
+    #[test]
+    fn relocated_mgmt_port_swaps_with_0_0() {
+        // mgmt-intf: Ethernet1/2 puts eth0 on 1/2 and eth6 on 0/0.
+        let p = ports(&netmap_text(7, 513, 2), 513, (1, 2)).unwrap();
+        let by = |s, q| p.iter().find(|x| (x.slot, x.port) == (s, q)).unwrap();
+        assert_eq!(by(1, 2).ifname, "eth0");
+        assert_eq!(by(1, 2).port_byte(), 0x21);
+        assert_eq!(by(0, 0).ifname, "eth6");
+        assert_eq!(by(0, 1).ifname, "eth1");
+        assert_eq!(by(1, 3).ifname, "eth7");
+        assert_eq!(by(0, 0).iol_id, 7);
     }
 
     #[test]
     fn netmap_comments_hosts_and_foreign_lines() {
         let netmap = "# comment\n\n1:0/0@a 513:0/0@a  # trailing\n2:0/0 3:0/0\n4:0/0 5:0/0 6:0/0\n\
             513:0/1 1:0/1\n1:1/0 513:1/0\n";
-        let c = parse(CLAB_INI, netmap).unwrap();
-        assert_eq!(c.ports.len(), 3);
-        assert_eq!(c.ports[1].iol_port, 0x10);
-    }
-
-    #[test]
-    fn netmap_extra_own_port_is_a_warning() {
-        let netmap = format!("{CLAB_NETMAP}1:2/0 513:2/0\n");
-        let c = parse(CLAB_INI, &netmap).unwrap();
-        assert_eq!(c.ports.len(), 3);
-        assert_eq!(c.warnings.len(), 1);
-    }
-
-    #[test]
-    fn other_ids_and_keys_ignored() {
-        let ini = "[default]\nnetmap = N\nfoo = bar\n[514:0/0]\neth_dev = eth9\n\
-            # comment\n; comment\n[513:0/0]\neth_dev = eth0\nbase_port = 1\n";
-        let i = parse_ini(ini, 513).unwrap();
-        assert_eq!(i.ports, vec![(0, 0, "eth0".to_string())]);
-    }
-
-    #[test]
-    fn rejects_bad_ini() {
-        assert!(parse_ini("eth_dev = eth0\n", 513).is_err());
-        assert!(parse_ini("[513:0/0]\ntap_dev = tap0\n", 513).is_err());
-        assert!(
-            parse_ini(
-                "[513:0/0]\neth_dev = eth0\n[513:0/0]\neth_dev = eth1\n",
-                513
-            )
-            .is_err()
-        );
-        assert!(parse_ini("[513:0/0]\neth_dev = eth0\neth_dev = eth1\n", 513).is_err());
-        assert!(
-            parse_ini(
-                "[513:0/0]\neth_dev = eth0\n[513:0/1]\neth_dev = eth0\n",
-                513
-            )
-            .is_err()
-        );
-        assert!(parse_ini("[513:0/0]\neth_dev =\n", 513).is_err());
-        assert!(parse_ini("[513:0/99]\neth_dev = eth0\n", 513).is_err());
-        assert!(parse_ini("[513:0/0]\nnonsense\n", 513).is_err());
+        let p = ports(netmap, 513, (0, 0)).unwrap();
+        assert_eq!(p.len(), 3);
+        assert_eq!(p[1].iol_port, 0x10);
+        assert_eq!(p[2].ifname, "eth4");
     }
 
     #[test]
     fn rejects_bad_netmap() {
+        let bad = |t: &str| ports(t, 513, (0, 0)).is_err();
         // duplicate mapping of one of our ports
-        assert!(parse_netmap("1:0/0 513:0/0\n2:0/0 513:0/0\n", 513).is_err());
+        assert!(bad("1:0/0 513:0/0\n2:0/0 513:0/0\n"));
         // segment with more than two members
-        assert!(parse_netmap("1:0/0 2:0/0 513:0/0\n", 513).is_err());
+        assert!(bad("1:0/0 2:0/0 513:0/0\n"));
         // a lone endpoint
-        assert!(parse_netmap("513:0/0\n", 513).is_err());
+        assert!(bad("513:0/0\n"));
         // both ends ours
-        assert!(parse_netmap("513:0/1 513:0/0\n", 513).is_err());
-        assert!(parse_netmap("1:0/0 513:x\n", 513).is_err());
-    }
-
-    #[test]
-    fn rejects_unmapped_ini_port() {
-        assert!(parse(CLAB_INI, "1:0/0 513:0/0\n1:0/1 513:0/1\n").is_err());
-        assert!(parse("[default]\n", "").is_err());
-    }
-
-    #[test]
-    fn load_resolves_relative_netmap() {
-        let dir = std::env::temp_dir().join(format!("netio-bridge-test-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("iouyap.ini"), "[513:0/0]\neth_dev = eth0\n").unwrap();
-        fs::write(dir.join("NETMAP"), "1:0/0 513:0/0\n").unwrap();
-        let c = load(&dir.join("iouyap.ini"), 513).unwrap();
-        assert_eq!(c.ports.len(), 1);
-        assert!(load(&dir.join("missing.ini"), 513).is_err());
-        fs::remove_dir_all(&dir).unwrap();
+        assert!(bad("513:0/1 513:0/0\n"));
+        assert!(bad("1:0/0 513:x\n"));
+        // none of ours
+        assert!(bad("1:0/0 2:0/0\n"));
+        assert!(bad(""));
     }
 }
