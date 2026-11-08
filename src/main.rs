@@ -6,6 +6,7 @@
 compile_error!("netio-bridge supports Linux only (AF_PACKET)");
 
 mod config;
+mod link;
 mod log;
 mod netio;
 mod port;
@@ -159,7 +160,14 @@ fn run(args: &Args) -> Result<Infallible, String> {
         ));
     }
 
-    let ports: Arc<Vec<Port>> = Arc::new(cfg.ports.into_iter().map(Port::new).collect());
+    let watcher = link::Watcher::open().map_err(|e| format!("rtnetlink socket: {e}"))?;
+    let ports = cfg
+        .ports
+        .into_iter()
+        .map(Port::new)
+        .collect::<io::Result<Vec<_>>>()
+        .map_err(|e| format!("eventfd: {e}"))?;
+    let ports: Arc<Vec<Port>> = Arc::new(ports);
     let unix_stats = Arc::new(UnixStats::default());
     for i in 0..ports.len() {
         let (ports, sock, id) = (ports.clone(), sock.clone(), args.id);
@@ -174,6 +182,13 @@ fn run(args: &Args) -> Result<Infallible, String> {
             .name("netio".into())
             .spawn(move || netio::run_reader(sock, id, ports, stats))
             .map_err(|e| format!("spawn netio thread: {e}"))?;
+    }
+    {
+        let ports = ports.clone();
+        thread::Builder::new()
+            .name("link".into())
+            .spawn(move || watcher.run(ports))
+            .map_err(|e| format!("spawn link thread: {e}"))?;
     }
     log::info(&format!("bridging {} ports on {path}", ports.len()));
 

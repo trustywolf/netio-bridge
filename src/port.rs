@@ -2,8 +2,9 @@
 //!
 //! Each port has its own thread that reads frames from the interface and sends
 //! them to IOL, and that alone opens, checks and replaces the port's socket. The
-//! NETIO reader only borrows the current socket to send, so a port that is down,
-//! deleted or recreated never affects another port.
+//! thread sleeps with no timeout; the link watcher wakes it on every link event
+//! in the namespace. The NETIO reader only borrows the current socket to send,
+//! so a port that is down, deleted or recreated never affects another port.
 
 use std::ffi::CString;
 use std::io;
@@ -16,6 +17,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::config::PortConfig;
+use crate::link::Wake;
 use crate::log;
 use crate::netio::{self, HEADER_LEN, UnixDest};
 use crate::stats::PortStats;
@@ -32,8 +34,11 @@ const RX_OFFSET: usize = HEADER_LEN + TAG_LEN;
 const MACS_LEN: usize = 12;
 const ETH_HLEN: usize = 14;
 
-const RECV_TIMEOUT: Duration = Duration::from_secs(1);
+/// How long a port waits before it tries again to open a socket on an
+/// interface that exists.
 const RETRY_INTERVAL: Duration = Duration::from_secs(1);
+/// Most frames read in one go before the port looks at its wake-ups again.
+const DRAIN_MAX: usize = 64;
 
 // From <linux/if_packet.h>, kept here so the build does not depend on which of
 // them the libc crate exports.
@@ -111,19 +116,22 @@ pub struct Port {
     /// closed only when the last clone is dropped, so it cannot be reused under
     /// a sender.
     sock: Mutex<Option<Arc<OwnedFd>>>,
+    /// Set by the link watcher: some interface changed, check ours.
+    pub wake: Wake,
     pub stats: PortStats,
     label: String,
 }
 
 impl Port {
-    pub fn new(cfg: PortConfig) -> Self {
+    pub fn new(cfg: PortConfig) -> io::Result<Self> {
         let label = format!("{} {}", cfg.name(), cfg.ifname);
-        Port {
+        Ok(Port {
             cfg,
             sock: Mutex::new(None),
+            wake: Wake::new()?,
             stats: PortStats::default(),
             label,
-        }
+        })
     }
 
     pub fn label(&self) -> &str {
@@ -182,13 +190,16 @@ impl Port {
         let mut buf = vec![0u8; RX_OFFSET + RX_SPACE];
         let mut missing_logged = false;
         loop {
+            // Taken back before the check, so a link event after it ends the
+            // wait below.
+            self.wake.clear();
             let ifindex = if_index(&self.cfg.ifname);
             if ifindex == 0 {
                 if !missing_logged {
                     log::notice(&format!("{}: interface not present, waiting", self.label));
                     missing_logged = true;
                 }
-                thread::sleep(RETRY_INTERVAL);
+                self.wake.wait();
                 continue;
             }
             let sock = match open(ifindex) {
@@ -222,7 +233,8 @@ impl Port {
         }
     }
 
-    /// Reads frames until the socket no longer belongs to `ifname`.
+    /// Reads frames until the socket no longer belongs to `ifname`. Sleeps in
+    /// poll() on the socket and the port's wake-up, with no timeout.
     fn forward(
         &self,
         sock: &OwnedFd,
@@ -232,17 +244,70 @@ impl Port {
         unix: &UnixDatagram,
         dest: &UnixDest,
     ) {
+        let mut fds = [
+            libc::pollfd {
+                fd: sock.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: self.wake.fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
         loop {
+            // SAFETY: fds is valid for its length.
+            if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) } < 0 {
+                let e = io::Error::last_os_error();
+                if e.raw_os_error() != Some(libc::EINTR) {
+                    log::error(
+                        &format!("poll {}", self.label),
+                        &format!("{}: poll: {e}", self.label),
+                    );
+                    thread::sleep(Duration::from_millis(100));
+                }
+                continue;
+            }
+            // A link changed in the namespace, perhaps ours. This also covers
+            // an interface deleted while down, which gives the socket no error.
+            if fds[1].revents != 0 {
+                self.wake.clear();
+                if !still_bound(sock.as_raw_fd(), &self.cfg.ifname, ifindex) {
+                    return;
+                }
+            }
+            if fds[0].revents != 0 && !self.drain(sock, ifindex, buf, header, unix, dest) {
+                return;
+            }
+        }
+    }
+
+    /// Forwards the frames the socket holds, at most `DRAIN_MAX` so that a busy
+    /// port still sees its wake-ups. False once the socket no longer belongs
+    /// to `ifname`.
+    fn drain(
+        &self,
+        sock: &OwnedFd,
+        ifindex: u32,
+        buf: &mut [u8],
+        header: &[u8; HEADER_LEN],
+        unix: &UnixDatagram,
+        dest: &UnixDest,
+    ) -> bool {
+        for _ in 0..DRAIN_MAX {
             let (len, aux) = match recv(sock.as_raw_fd(), buf) {
                 Ok(Some(r)) => r,
                 // Our own transmissions, when PACKET_IGNORE_OUTGOING is missing.
                 Ok(None) => continue,
                 Err(e) => {
                     match e.raw_os_error() {
-                        // Timeout, or an interrupted read.
-                        Some(libc::EAGAIN) | Some(libc::EINTR) => {}
-                        // One-off error when the interface goes down; the
-                        // socket starts receiving again once it comes back up.
+                        // Nothing left, or an interrupted read.
+                        Some(libc::EAGAIN) => return true,
+                        Some(libc::EINTR) => continue,
+                        // One-off error when the interface goes down, or is
+                        // deleted while up; once it is back up the socket
+                        // receives again.
                         Some(libc::ENETDOWN) => {}
                         _ => {
                             log::error(
@@ -252,10 +317,7 @@ impl Port {
                             thread::sleep(Duration::from_millis(100));
                         }
                     }
-                    if !still_bound(sock.as_raw_fd(), &self.cfg.ifname, ifindex) {
-                        return;
-                    }
-                    continue;
+                    return still_bound(sock.as_raw_fd(), &self.cfg.ifname, ifindex);
                 }
             };
             if len > RX_SPACE {
@@ -289,6 +351,7 @@ impl Port {
                 }
             }
         }
+        true
     }
 }
 
@@ -352,11 +415,6 @@ fn open(ifindex: u32) -> io::Result<OwnedFd> {
     set_opt(fd, libc::SOL_PACKET, PACKET_AUXDATA, &one)?;
     // Kernels before 4.20 lack it; recv() then filters by packet type instead.
     let _ = set_opt(fd, libc::SOL_PACKET, PACKET_IGNORE_OUTGOING, &one);
-    let tv = libc::timeval {
-        tv_sec: RECV_TIMEOUT.as_secs() as libc::time_t,
-        tv_usec: 0,
-    };
-    set_opt(fd, libc::SOL_SOCKET, libc::SO_RCVTIMEO, &tv)?;
 
     // SAFETY: sockaddr_ll is plain old data; all-zero is a valid value.
     let mut sll: libc::sockaddr_ll = unsafe { mem::zeroed() };
@@ -380,9 +438,9 @@ fn open(ifindex: u32) -> io::Result<OwnedFd> {
     Ok(sock)
 }
 
-/// Receives one frame at `buf[RX_OFFSET..]`. Returns its full length (which may
-/// exceed the buffer: MSG_TRUNC) and the auxiliary data, or `None` for a frame
-/// we sent ourselves.
+/// Receives one frame at `buf[RX_OFFSET..]` without blocking. Returns its full
+/// length (which may exceed the buffer: MSG_TRUNC) and the auxiliary data, or
+/// `None` for a frame we sent ourselves.
 fn recv(fd: RawFd, buf: &mut [u8]) -> io::Result<Option<(usize, Option<AuxData>)>> {
     let space = buf.len() - RX_OFFSET;
     // SAFETY: every pointer in msg refers to a live local or into buf, with the
@@ -401,7 +459,7 @@ fn recv(fd: RawFd, buf: &mut [u8]) -> io::Result<Option<(usize, Option<AuxData>)
         msg.msg_iovlen = 1;
         msg.msg_control = cbuf.as_mut_ptr().cast();
         msg.msg_controllen = mem::size_of_val(&cbuf) as _;
-        let n = libc::recvmsg(fd, &mut msg, libc::MSG_TRUNC);
+        let n = libc::recvmsg(fd, &mut msg, libc::MSG_TRUNC | libc::MSG_DONTWAIT);
         if n < 0 {
             return Err(io::Error::last_os_error());
         }

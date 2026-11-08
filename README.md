@@ -18,7 +18,7 @@ IOL ports down for good:
 | --- | --- | --- |
 | A peer's veth disappears (peer container stopped or removed) | The thread that serves every port exits on the first failed write; the whole node, management port included, goes dark ([containerlab#3422](https://github.com/srl-labs/containerlab/issues/3422)) | Only that frame is lost; other ports are untouched |
 | The container's own interface goes down and up | The port's reader exits on `ENETDOWN` and never reopens | The port resumes when the interface is up again |
-| The interface is deleted and recreated (new ifindex) | The port stays dead | The port reopens on the new interface within about a second |
+| The interface is deleted and recreated (new ifindex) | The port stays dead | The port reopens on the new interface as soon as it appears |
 | An 802.1Q-tagged frame longer than 4092 bytes arrives | Stack buffer overflow; the process is killed | Frames up to 9220 bytes are forwarded; longer ones are counted and dropped |
 
 ## How it works
@@ -27,8 +27,8 @@ IOL ports down for good:
   sends each frame to its port's packet socket with `MSG_DONTWAIT`. A send error
   costs that frame only; this thread never changes port state.
 - Each port has its own thread with an `AF_PACKET` socket bound to the
-  interface's ifindex (promiscuous, `PACKET_AUXDATA`, `PACKET_IGNORE_OUTGOING`,
-  1 s receive timeout). Frames are sent to IOL with an 8-byte NETIO header.
+  interface's ifindex (promiscuous, `PACKET_AUXDATA`, `PACKET_IGNORE_OUTGOING`).
+  Frames are sent to IOL with an 8-byte NETIO header.
   When IOL's receive queue is full, the port's thread waits up to 100 ms for
   room before it drops the frame. The queue holds `net.unix.max_dgram_qlen`
   datagrams, only 10 in a container's fresh network namespace, so a burst of
@@ -43,10 +43,15 @@ IOL ports down for good:
 - The kernel strips the outer VLAN tag before a packet socket sees a frame.
   netio-bridge puts it back from `PACKET_AUXDATA`: 802.1Q or 802.1ad TPID as
   reported, priority-tagged frames (VID 0) included.
-- On a receive timeout or error, the port thread checks that the interface still
-  exists with the ifindex the socket is bound to. If not, it closes the socket
-  and retries every second until the interface is back. An interface missing at
-  start-up is handled the same way.
+- One more thread holds an rtnetlink socket in the link group. Every link
+  message (an interface added, renamed, changed or deleted in the namespace)
+  wakes every port thread through its eventfd. A port thread sleeps in `poll()`
+  on its packet socket and its eventfd, with no timeout. Woken, or on a receive
+  error, it checks that the interface still exists with the ifindex the socket
+  is bound to; if not, it closes the socket and opens one on the new interface
+  as soon as a link event shows it. An interface missing at start-up is handled
+  the same way. An interface deleted while down gives the socket no error, so
+  the link event is the only notice. An idle bridge does not wake up at all.
 - The socket of a port is shared through `Mutex<Option<Arc<OwnedFd>>>`: a sender
   holds its own reference, so a socket being replaced is never closed under it.
 - One bridge per id: at start-up netio-bridge takes an `fcntl` write lock on
