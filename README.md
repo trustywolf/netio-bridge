@@ -39,7 +39,9 @@ IOL ports down for good:
   IOL has opened its NETIO socket. The port threads start only once a
   `connect()` to IOL's socket succeeds: `ENOENT` (no file yet) and
   `ECONNREFUSED` (a file left by an earlier run, as after a container restart)
-  mean IOL is not listening yet, and the bridge tries again every 50 ms.
+  mean IOL is not listening yet, and the bridge tries again every 50 ms. A
+  frame that arrives before then is lost either way, as IOL is not reading; the
+  wait keeps it out of the error log.
 - The kernel strips the outer VLAN tag before a packet socket sees a frame.
   netio-bridge puts it back from `PACKET_AUXDATA`: 802.1Q or 802.1ad TPID as
   reported, priority-tagged frames (VID 0) included.
