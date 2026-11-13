@@ -1,5 +1,5 @@
-//! Append-only log file. Nothing goes to stdout or stderr: in the IOL image
-//! they are the router console.
+//! Append-only log file. Nothing goes to stdout or stderr, a panic's message
+//! included: in the IOL image they are the router console.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -81,6 +81,21 @@ pub fn error(key: &str, msg: &str) {
     } else {
         write(&mut l, "ERROR", msg);
     }
+}
+
+/// Sends a panic's message to the log instead of stderr, the router console.
+/// A release build then aborts, and the entrypoint's loop restarts the bridge.
+pub fn log_panics() {
+    std::panic::set_hook(Box::new(|info| {
+        let thread = std::thread::current();
+        // The message is printed as `panicked at <place>:\n<text>`.
+        let msg = format!("thread {} {info}", thread.name().unwrap_or("?"));
+        let msg = msg.replace(":\n", ": ").replace('\n', " ");
+        // try_lock: the panicking thread may hold the logger itself.
+        if let Some(Ok(mut l)) = LOGGER.get().map(|m| m.try_lock()) {
+            write(&mut l, "ERROR", &msg);
+        }
+    }));
 }
 
 /// UTC time as `YYYY-MM-DDTHH:MM:SS.mmmZ`.

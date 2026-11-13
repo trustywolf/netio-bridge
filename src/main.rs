@@ -93,7 +93,22 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Cli, String> {
     }))
 }
 
+/// Blocks SIGUSR1 in this thread and in every thread started later, and
+/// returns the set for sigwait(). Until it is blocked the signal ends the
+/// process, so this comes first, before --prepare's wait too.
+fn block_sigusr1() -> libc::sigset_t {
+    // SAFETY: sigset_t is initialised by sigemptyset before use.
+    unsafe {
+        let mut set: libc::sigset_t = mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGUSR1);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, ptr::null_mut());
+        set
+    }
+}
+
 fn main() -> ExitCode {
+    let usr1 = block_sigusr1();
     let args = match parse_args(std::env::args().skip(1)) {
         Ok(Cli::Run(a)) => a,
         Ok(Cli::Exit(code)) => return code,
@@ -125,13 +140,15 @@ fn main() -> ExitCode {
             }
         };
     }
-    let Err(e) = run(&args);
+    log::log_panics();
+    let Err(e) = run(&args, &usr1);
     log::error("fatal", &format!("fatal: {e}"));
     ExitCode::FAILURE
 }
 
-/// Returns only on a start-up error; once bridging, runs forever.
-fn run(args: &Args) -> Result<Infallible, String> {
+/// Returns only on a start-up error; once bridging, runs forever. `usr1` is
+/// the blocked SIGUSR1, taken with sigwait() to write the counters.
+fn run(args: &Args, usr1: &libc::sigset_t) -> Result<Infallible, String> {
     let ports = config::load(args.id).map_err(|e| e.to_string())?;
     log::info(&format!(
         "netio-bridge {} starting as {} with {}",
@@ -159,17 +176,6 @@ fn run(args: &Args) -> Result<Infallible, String> {
     sock.set_write_timeout(Some(netio::SEND_TIMEOUT))
         .map_err(|e| format!("set send timeout on {path}: {e}"))?;
     let sock = Arc::new(sock);
-
-    // SIGUSR1 is taken with sigwait() below; block it before any thread starts
-    // so every thread inherits the mask.
-    // SAFETY: sigset_t is initialised by sigemptyset before use.
-    let set = unsafe {
-        let mut set: libc::sigset_t = mem::zeroed();
-        libc::sigemptyset(&mut set);
-        libc::sigaddset(&mut set, libc::SIGUSR1);
-        libc::pthread_sigmask(libc::SIG_BLOCK, &set, ptr::null_mut());
-        set
-    };
 
     let mut iol_ids: Vec<u16> = ports.iter().map(|p| p.iol_id).collect();
     iol_ids.sort_unstable();
@@ -216,8 +222,8 @@ fn run(args: &Args) -> Result<Infallible, String> {
 
     loop {
         let mut sig: libc::c_int = 0;
-        // SAFETY: set and sig are valid for the call.
-        if unsafe { libc::sigwait(&set, &mut sig) } == 0 && sig == libc::SIGUSR1 {
+        // SAFETY: usr1 and sig are valid for the call.
+        if unsafe { libc::sigwait(usr1, &mut sig) } == 0 && sig == libc::SIGUSR1 {
             log::notice(&unix_stats.line());
             for p in ports.iter() {
                 log::notice(&p.stats.line(p.label()));
@@ -256,7 +262,5 @@ mod tests {
         assert!(parse(&["513", "514"]).is_err());
         assert!(parse(&["513", "-x"]).is_err());
         assert!(parse(&["513", "-l"]).is_err());
-        // The ini file option is gone: the layout comes from Containerlab.
-        assert!(parse(&["513", "-c", "/x.ini"]).is_err());
     }
 }

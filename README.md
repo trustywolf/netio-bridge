@@ -11,8 +11,8 @@ code.
 
 ## Why
 
-`iouyap` 0.97.5, as shipped for Containerlab, has three failure modes that take
-IOL ports down for good:
+`iouyap` 0.97.5, the bridge of Containerlab's own IOL images until 2026-11-02,
+has four failure modes that take IOL ports down for good:
 
 | Event | iouyap 0.97.5 | netio-bridge |
 | --- | --- | --- |
@@ -20,6 +20,9 @@ IOL ports down for good:
 | The container's own interface goes down and up | The port's reader exits on `ENETDOWN` and never reopens | The port resumes when the interface is up again |
 | The interface is deleted and recreated (new ifindex) | The port stays dead | The port reopens on the new interface as soon as it appears |
 | An 802.1Q-tagged frame longer than 4092 bytes arrives | Stack buffer overflow; the process is killed | Frames up to 9220 bytes are forwarded; longer ones are counted and dropped |
+
+Those images now run [iouyap-go](https://github.com/clab-labs/iouyap-go)
+([vrnetlab#561](https://github.com/srl-labs/vrnetlab/pull/561)).
 
 ## How it works
 
@@ -37,9 +40,9 @@ IOL ports down for good:
   `net.unix.max_dgram_qlen: 512`) also helps the other direction.
 - The bridge and IOL start together, so a neighbour's frame can arrive before
   IOL has opened its NETIO socket. The port threads start only once a
-  `connect()` to IOL's socket succeeds: `ENOENT` (no file yet) and
-  `ECONNREFUSED` (a file left by an earlier run, as after a container restart)
-  mean IOL is not listening yet, and the bridge tries again every 50 ms. A
+  `connect()` to IOL's socket no longer fails with `ENOENT` (no file yet) or
+  `ECONNREFUSED` (a file left by an earlier run, as after a container restart):
+  until then IOL is not listening, and the bridge tries again every 50 ms. A
   frame that arrives before then is lost either way, as IOL is not reading; the
   wait keeps it out of the error log.
 - The kernel strips the outer VLAN tag before a packet socket sees a frame.
@@ -61,10 +64,11 @@ IOL ports down for good:
   its PID into it. A second instance (say, one started by hand for debugging)
   exits with an error instead of unlinking the socket and taking it over, which
   would leave IOL sending to a dead socket once it quit.
-- The process exits only on a start-up error (invalid NETMAP or Containerlab
-  variables, the lock is held, NETIO socket cannot be bound). Release builds abort on a panic, so a
-  restart loop around the process (see below) recovers every port instead of
-  leaving one thread dead.
+- The process exits only on a start-up error, such as an invalid NETMAP or
+  Containerlab variable, a held lock or a NETIO socket that cannot be bound.
+  Release builds write a panic to the log and abort, so a restart loop around
+  the process (see below) recovers every port instead of leaving one thread
+  dead.
 
 ## Usage
 
@@ -76,10 +80,12 @@ netio-bridge <appl_id> [--prepare] [-q] [-l <log file>]
                  every slot and print the slot count (for iol.bin -e)
   -q             quiet: leave out start-up messages
   -l <log file>  default /tmp/netio-bridge.log
+  -h, --help     show this help
+  -V, --version  show the version
 ```
 
-Nothing is written to stdout or stderr at run time: in an IOL container they are
-the router console. The log holds start-up messages (`INFO`, left out with
+A running bridge writes nothing to stdout or stderr: in an IOL container they
+are the router console. The log holds start-up messages (`INFO`, left out with
 `-q`), port state changes (`NOTICE`) and errors (`ERROR`, at most one per kind
 and port every ten seconds, with a count of the ones held back). Send `SIGUSR1`
 to write the traffic and drop counters to the log.
@@ -103,19 +109,21 @@ The bridge then reads `/iol/NETMAP` back and serves `<slot>/<port>` on
 `Ethernet0/0`, so `eth0` is always management. The management port is the one
 `CLAB_IOL_MGMT_INTF` names (Containerlab 0.83 and later), else the one
 Containerlab's `/iol/iouyap.ini` gives `eth0`, else `Ethernet0/0`. A link added
-later to a running node then works too, and a restarted bridge serves exactly
+later to a running node (`containerlab tools veth create`, or a deploy with
+`link-apply-mode: live`) then works too, and a restarted bridge serves exactly
 the ports IOL booted with.
 
 `--prepare` stops with an error, and the entrypoint should not start IOL, when
-`IOL_PID`, `CLAB_IOL_NUM_SLOTS` or `CLAB_IOL_MGMT_INTF` is invalid or the
-management port lies beyond the slots. The bridge stops at start-up when
-`/iol/NETMAP` is missing, maps one of our ports twice or has a line that is not
-a point-to-point link between one of our ports and one IOL port.
+`IOL_PID` is missing or invalid, `CLAB_IOL_NUM_SLOTS` or `CLAB_IOL_MGMT_INTF` is
+invalid, or the management port lies beyond the slots. The bridge stops at
+start-up when `/iol/NETMAP` is missing, lists none of our ports, maps one of
+them twice, or wires one of them to anything but a single IOL port.
 
 ### In a Containerlab IOL image
 
-Build it from source in a builder stage. In the entrypoint, run `--prepare`,
-start the bridge in a restart loop, then IOL:
+Build it from source in a builder stage. In the entrypoint, take the addresses
+off `eth0` (IOL's management port uses them), run `--prepare`, start the bridge
+in a restart loop, then IOL:
 
 ```dockerfile
 FROM ubuntu:resolute AS netio-bridge-build
@@ -132,6 +140,8 @@ COPY --from=netio-bridge-build /src/target/release/netio-bridge /usr/bin/netio-b
 ```
 
 ```bash
+ip addr flush dev eth0
+ip -6 addr flush dev eth0
 num_slots=$(/usr/bin/netio-bridge 513 --prepare) || exit 1
 ( while :; do /usr/bin/netio-bridge 513 -q; sleep 1; done ) &
 exec /iol/iol.bin $IOL_PID -e $num_slots -s 0 -c config.txt -n 1024

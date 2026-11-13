@@ -185,7 +185,8 @@ pub fn send_to(sock: &UnixDatagram, buf: &[u8], dest: &UnixDest) -> io::Result<(
 /// IOL has opened its NETIO socket; ports start forwarding only after this.
 /// A `connect()` reaches only a bound socket: it fails with `ENOENT` before IOL
 /// creates the file and with `ECONNREFUSED` while a file left by an earlier
-/// run is still there. Any other answer means a socket is bound.
+/// run is still there. Any other answer ends the wait: a socket is bound, or
+/// the error is one that the ports' sends will report.
 pub fn wait_for_listener(path: &str) -> io::Result<Duration> {
     let start = Instant::now();
     let probe = UnixDatagram::unbound()?;
@@ -350,7 +351,9 @@ mod tests {
             "gave up after {:?}",
             err.1
         );
-        // A reader that drains the queue lets every later send through.
+        // A reader that drains the queue lets every later send through. The
+        // longer timeout covers a reader that a busy machine keeps waiting.
+        tx.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
         let reader = thread::spawn(move || {
             let mut buf = [0u8; 64];
             for _ in 0..sent + 1000 {

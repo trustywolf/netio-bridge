@@ -615,7 +615,11 @@ mod tests {
 
     #[test]
     fn auxdata_layout() {
+        // struct tpacket_auxdata of <linux/if_packet.h>.
         assert_eq!(mem::size_of::<AuxData>(), 20);
+        assert_eq!(mem::offset_of!(AuxData, tp_status), 0);
+        assert_eq!(mem::offset_of!(AuxData, tp_vlan_tci), 16);
+        assert_eq!(mem::offset_of!(AuxData, tp_vlan_tpid), 18);
     }
 
     #[test]
