@@ -150,6 +150,13 @@ exec /iol/iol.bin $IOL_PID -e $num_slots -s 0 -c config.txt -n 1024
 The container must be allowed to open packet sockets and set promiscuous mode
 (Containerlab runs IOL nodes privileged).
 
+Releases from 0.5.1 on also carry an amd64 package for Ubuntu 26.04, in place
+of the builder stage. It installs `/usr/bin/netio-bridge`:
+
+```sh
+apt-get install ./netio-bridge_<version>_amd64.deb
+```
+
 ## Limitations
 
 - Linux only (`AF_PACKET`).
@@ -175,6 +182,10 @@ cargo build --release --locked
 ```
 
 The only dependency is the `libc` crate, pinned in `Cargo.lock`.
+
+`packaging/deb.sh` builds the package into `target/` (needs `dpkg-dev`). CI
+runs it on every push, and a `v<version>` tag publishes the package as a GitHub
+release.
 
 ## License
 

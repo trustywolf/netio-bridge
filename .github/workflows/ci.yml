@@ -23,3 +23,36 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
       - run: cargo build --release --locked
+
+  # The amd64 package for Ubuntu 26.04, built on every push so that a tag
+  # finds it working. A v<version> tag also publishes it as a GitHub release.
+  deb:
+    needs: check
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Package
+        run: |
+          deb=$(packaging/deb.sh)
+          echo "DEB=$deb" >> "$GITHUB_ENV"
+          dpkg-deb --info "$deb"
+          dpkg-deb --contents "$deb"
+      - name: Install
+        run: |
+          sudo apt-get install -y "./$DEB"
+          test "netio-bridge $(dpkg-deb -f "$DEB" Version)" = \
+            "$(netio-bridge --version)"
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$GITHUB_REF_NAME" = "v$(dpkg-deb -f "$DEB" Version)"
+          gh release create "$GITHUB_REF_NAME" "$DEB" --verify-tag \
+            --title "netio-bridge ${GITHUB_REF_NAME#v}" --generate-notes
