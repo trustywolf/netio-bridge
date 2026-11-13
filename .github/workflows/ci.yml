@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
       - name: Toolchain
@@ -24,8 +24,9 @@ jobs:
       - run: cargo test --locked
       - run: cargo build --release --locked
 
-  # The amd64 package for Ubuntu 26.04, built on every push so that a tag
-  # finds it working. A v<version> tag also publishes it as a GitHub release.
+  # The amd64 and amd64v3 packages for Ubuntu 26.04, built on every push so
+  # that a tag finds them working. A v<version> tag also publishes them as a
+  # GitHub release.
   deb:
     needs: check
     runs-on: ubuntu-26.04
@@ -39,20 +40,24 @@ jobs:
           rustup default stable
       - name: Package
         run: |
-          deb=$(packaging/deb.sh)
-          echo "DEB=$deb" >> "$GITHUB_ENV"
-          dpkg-deb --info "$deb"
-          dpkg-deb --contents "$deb"
+          for variant in amd64 amd64v3; do
+            deb=$(packaging/deb.sh "$variant")
+            dpkg-deb --info "$deb"
+            dpkg-deb --contents "$deb"
+          done
       - name: Install
         run: |
-          sudo apt-get install -y "./$DEB"
-          test "netio-bridge $(dpkg-deb -f "$DEB" Version)" = \
-            "$(netio-bridge --version)"
+          for deb in target/*.deb; do
+            sudo dpkg -i "$deb"
+            test "netio-bridge $(dpkg-deb -f "$deb" Version)" = \
+              "$(netio-bridge --version)"
+          done
       - name: Release
         if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          test "$GITHUB_REF_NAME" = "v$(dpkg-deb -f "$DEB" Version)"
-          gh release create "$GITHUB_REF_NAME" "$DEB" --verify-tag \
-            --title "netio-bridge ${GITHUB_REF_NAME#v}" --generate-notes
+          version=$(dpkg-query -W -f '${Version}' netio-bridge)
+          test "$GITHUB_REF_NAME" = "v$version"
+          gh release create "$GITHUB_REF_NAME" target/*.deb --verify-tag \
+            --title "netio-bridge $version" --generate-notes
